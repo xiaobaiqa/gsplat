@@ -1,0 +1,37 @@
+{
+  "name": "gsplat-cuda12.8-dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace/gsplat",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/gsplat,type=bind,consistency=cached",
+  "runArgs": [
+    "--gpus=all",
+    "--ipc=host",
+    "--shm-size=8g",
+    "--ulimit=memlock=-1",
+    "--ulimit=stack=67108864",
+    "--network=host"
+  ],
+  "containerEnv": {
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,graphics",
+    "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+    "FORCE_CUDA": "1"
+  },
+  "postCreateCommand": "bash .devcontainer/postCreate.sh",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/bin/python3",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ]
+    }
+  }
+}
