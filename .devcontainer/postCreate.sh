@@ -9,9 +9,16 @@ python -m pip install --upgrade pip setuptools wheel
 # Mark the workspace as safe so git/submodule operations remain reliable.
 git config --global --add safe.directory /workspace/gsplat
 
+# Submodules can be checked by git from their own working tree path, so each
+# path needs to be marked safe before running submodule commands.
+if [[ -f .gitmodules ]]; then
+  while IFS= read -r submodule_path; do
+    git config --global --add safe.directory "/workspace/gsplat/${submodule_path}"
+  done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}')
+fi
+
 # The CUDA extension depends on the vendored glm headers provided via git submodule.
-git submodule update --init
-git config --global --add safe.directory /workspace/gsplat/gsplat/cuda/csrc/third_party/glm
+git submodule update --init --recursive
 
 # Match CUDA 12.8 image and RTX 50-series hardware.
 python -m pip install \
