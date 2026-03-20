@@ -53,7 +53,7 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
 from gsplat.cuda._wrapper import CameraModel
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, ResidualCoverageStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -132,7 +132,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, ResidualCoverageStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -865,6 +865,9 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
+            if isinstance(self.cfg.strategy, ResidualCoverageStrategy):
+                info[self.cfg.strategy.residual_key] = (colors.detach() - pixels).abs().mean()
+
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -1432,6 +1435,12 @@ if __name__ == "__main__":
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
                 strategy=DefaultStrategy(verbose=True),
+            ),
+        ),
+        "residual_coverage": (
+            "Gaussian splatting training using residual- and coverage-aware densification.",
+            Config(
+                strategy=ResidualCoverageStrategy(verbose=True),
             ),
         ),
         "mcmc": (

@@ -1,0 +1,53 @@
+SCENE="garden"
+SCENE_DIR="data/360_v2"
+RESULT_DIR="results/benchmark_rc/garden"
+
+CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
+    --disable_viewer true \
+    --data_dir ${SCENE_DIR}/${SCENE}/ \
+    --data_factor 4 \
+    --result_dir ${RESULT_DIR}/ \
+    --batch_size 1 \
+    --max_steps 30000 \
+    --eval_steps 7000 30000 \
+    --save_steps 7000 30000 \
+    --test_every 8 \
+    --init_type sfm \
+    --init_num_pts 100000 \
+    --init_extent 3.0 \
+    --init_opa 0.1 \
+    --init_scale 1.0 \
+    --sh_degree 3 \
+    --sh_degree_interval 1000 \
+    --ssim_lambda 0.2 \
+    --near_plane 0.01 \
+    --far_plane 1e10 \
+    --packed false \
+    --sparse_grad false \
+    --visible_adam false \
+    --antialiased false \
+    --random_bkgd false \
+    --means_lr 1.6e-4 \
+    --scales_lr 5e-3 \
+    --opacities_lr 5e-2 \
+    --quats_lr 1e-3 \
+    --sh0_lr 2.5e-3 \
+    --shN_lr 1.25e-4 \
+    --strategy.prune-opa 0.005 \
+    --strategy.grow-scale3d 0.01 \
+    --strategy.grow-scale2d 0.05 \
+    --strategy.prune-scale3d 0.1 \
+    --strategy.prune-scale2d 0.15 \
+    --strategy.refine-start-iter 500 \
+    --strategy.refine-stop-iter 15000 \
+    --strategy.refine-every 100 \
+    --strategy.reset-every 3000 \
+    --strategy.absgrad false \
+    --strategy.revised-opacity false \
+    --strategy.key-for-gradient means2d \
+    --strategy.lambda-grad 0.6 \
+    --strategy.lambda-residual 0.4 \
+    --strategy.grow-score 0.55 \
+    --strategy.coverage-min 0.05 \
+    --strategy.residual-ema-decay 0.9 \
+    --strategy.coverage-ema-decay 0.99

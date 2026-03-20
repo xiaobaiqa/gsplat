@@ -57,7 +57,7 @@ from .rendering import (
     rasterization_2dgs_inria_wrapper,
     rasterization_inria_wrapper,
 )
-from .strategy import DefaultStrategy, MCMCStrategy, Strategy
+from .strategy import DefaultStrategy, MCMCStrategy, ResidualCoverageStrategy, Strategy
 from .version import __version__
 from .cuda._lidar import (
     compute_angles_to_columns_map as compute_lidar_angles_to_columns_map,
@@ -71,6 +71,7 @@ all = [
     "PngCompression",
     "DefaultStrategy",
     "MCMCStrategy",
+    "ResidualCoverageStrategy",
     "Strategy",
     "CameraModel",
     "ExternalDistortionModelMeta",

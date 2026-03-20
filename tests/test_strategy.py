@@ -33,7 +33,7 @@ device = torch.device("cuda:0")
 @pytest.mark.skipif(not gsplat.has_3dgs(), reason="3DGS support isn't built in")
 def test_strategy():
     from gsplat.rendering import rasterization
-    from gsplat.strategy import DefaultStrategy, MCMCStrategy
+    from gsplat.strategy import DefaultStrategy, MCMCStrategy, ResidualCoverageStrategy
 
     torch.manual_seed(42)
 
@@ -72,6 +72,15 @@ def test_strategy():
     render_colors.mean().backward(retain_graph=True)
     strategy.step_post_backward(params, optimizers, state, step=600, info=info)
 
+    # Test ResidualCoverageStrategy
+    strategy = ResidualCoverageStrategy(verbose=True)
+    strategy.check_sanity(params, optimizers)
+    state = strategy.initialize_state()
+    strategy.step_pre_backward(params, optimizers, state, step=600, info=info)
+    info[strategy.residual_key] = torch.tensor(0.1, device=device)
+    render_colors.mean().backward(retain_graph=True)
+    strategy.step_post_backward(params, optimizers, state, step=600, info=info)
+
     # Test MCMCStrategy
     strategy = MCMCStrategy(verbose=True)
     strategy.check_sanity(params, optimizers)
@@ -84,7 +93,7 @@ def test_strategy():
 @pytest.mark.skipif(not gsplat.has_3dgs(), reason="3DGS support isn't built in")
 def test_strategy_requires_grad():
     from gsplat.rendering import rasterization
-    from gsplat.strategy import DefaultStrategy, MCMCStrategy
+    from gsplat.strategy import DefaultStrategy, MCMCStrategy, ResidualCoverageStrategy
 
     def assert_consistent_sizes(params):
         sizes = [v.shape[0] for v in params.values()]
@@ -135,6 +144,20 @@ def test_strategy_requires_grad():
         assert v.requires_grad == requires_grad_map[k]
     assert params["non_trainable_features"].grad is None
     assert_consistent_sizes(params)
+
+    # Test ResidualCoverageStrategy
+    strategy = ResidualCoverageStrategy(verbose=True)
+    strategy.check_sanity(params, optimizers)
+    state = strategy.initialize_state()
+    strategy.step_pre_backward(params, optimizers, state, step=600, info=info)
+    info[strategy.residual_key] = torch.tensor(0.1, device=device)
+    render_colors.mean().backward(retain_graph=True)
+    strategy.step_post_backward(params, optimizers, state, step=600, info=info)
+    assert params["non_trainable_features"].grad is None
+    for k, v in params.items():
+        assert v.requires_grad == requires_grad_map[k]
+    assert_consistent_sizes(params)
+
     # Test MCMCStrategy
     strategy = MCMCStrategy(verbose=True)
     strategy.check_sanity(params, optimizers)
