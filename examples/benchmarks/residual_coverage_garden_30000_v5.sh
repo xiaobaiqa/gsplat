@@ -1,6 +1,6 @@
 SCENE="garden"
 SCENE_DIR="data/360_v2"
-RESULT_DIR="results/benchmark_rc_7000_v6/garden"
+RESULT_DIR="results/benchmark_rc_30000_v5_budget/garden"
 
 CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
     --disable-viewer \
@@ -8,9 +8,9 @@ CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
     --data-factor 4 \
     --result-dir ${RESULT_DIR}/ \
     --batch-size 1 \
-    --max-steps 7000 \
-    --eval-steps 7000 \
-    --save-steps 7000 \
+    --max-steps 30000 \
+    --eval-steps 7000 30000 \
+    --save-steps 7000 30000 \
     --test-every 8 \
     --init-type sfm \
     --init-num-pts 100000 \
@@ -45,7 +45,9 @@ CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
     --strategy.no-absgrad \
     --strategy.no-revised-opacity \
     --strategy.key-for-gradient means2d \
-    --strategy.growth-topk-ratio 0.25 \
+    --strategy.growth-topk-ratio 0.22 \
+    --strategy.max-new-gs 20000 \
+    --strategy.cap-max 5200000 \
     --strategy.residual-threshold 0.20 \
     --strategy.coverage-min 0.05 \
     --strategy.target-coverage 0.15 \
