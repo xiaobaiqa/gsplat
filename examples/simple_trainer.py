@@ -866,7 +866,9 @@ class Runner:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
             if isinstance(self.cfg.strategy, ResidualCoverageStrategy):
-                info[self.cfg.strategy.residual_key] = (colors.detach() - pixels).abs().mean()
+                info[self.cfg.strategy.residual_key] = (
+                    colors.detach() - pixels
+                ).abs().mean(dim=-1)
 
             loss.backward()
 

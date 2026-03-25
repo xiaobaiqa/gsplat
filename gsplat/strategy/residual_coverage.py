@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Union
 
 import torch
-
 from .default import DefaultStrategy
 from .ops import duplicate, remove, split
 
@@ -33,22 +32,32 @@ class ResidualCoverageStrategy(DefaultStrategy):
     - ``residual_ema``: an EMA of reconstruction error for visible Gaussians.
     - ``coverage_ema``: an EMA of how often a Gaussian is visible.
 
-    The trainer is expected to populate ``info["residual_value"]`` before
-    :meth:`step_post_backward`. A scalar batch-level residual is sufficient for a first
-    implementation and keeps the strategy decoupled from the rasterizer internals.
+    The trainer is expected to populate ``info["residual_map"]`` with a per-view residual
+    image of shape ``[C, H, W]`` or ``[H, W]`` before :meth:`step_post_backward`.
+    The strategy samples that map at each visible Gaussian projection, so the residual
+    signal stays local instead of collapsing to a single image-wide scalar.
     """
 
-    lambda_grad: float = 0.6
-    lambda_residual: float = 0.4
-    grow_score: float = 0.55
+    lambda_grad: float = 1.0
+    lambda_residual: float = 0.35
+    lambda_coverage: float = 0.0
+    grow_score: float = 0.35
     coverage_min: float = 0.05
     residual_ema_decay: float = 0.9
     coverage_ema_decay: float = 0.99
+    relaxed_grad_factor: float = 0.5
+    residual_threshold: float = 0.25
+    coverage_warmup_iter: int = 2000
+    base_coverage_min: float = 0.01
+    target_coverage: float = 0.2
+    coverage_peak: float = 0.6
+    growth_topk_ratio: float = 0.12
+    max_new_gs: int = -1
     cap_max: int = -1
     prune_opacity_weight: float = 0.5
     prune_coverage_weight: float = 0.3
     prune_residual_weight: float = 0.2
-    residual_key: str = "residual_value"
+    residual_key: str = "residual_map"
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         state = super().initialize_state(scene_scale=scene_scale)
@@ -65,9 +74,6 @@ class ResidualCoverageStrategy(DefaultStrategy):
     ):
         super()._update_state(params, state, info, packed=packed)
 
-        if self.residual_key not in info:
-            return
-
         n_gaussian = len(list(params.values())[0])
         device = params["means"].device
         if state["residual_ema"] is None:
@@ -75,32 +81,52 @@ class ResidualCoverageStrategy(DefaultStrategy):
         if state["coverage_ema"] is None:
             state["coverage_ema"] = torch.zeros(n_gaussian, device=device)
 
-        residual_value = info[self.residual_key]
-        if not torch.is_tensor(residual_value):
-            residual_value = torch.tensor(residual_value, device=device)
-        residual_value = residual_value.detach().to(device=device).float().reshape(-1)
-        if residual_value.numel() == 0:
-            return
-        residual_scalar = residual_value.mean()
-
-        if packed:
-            gs_ids = info["gaussian_ids"]
-            visible_mask = torch.zeros(n_gaussian, dtype=torch.bool, device=device)
-            visible_mask[gs_ids] = True
-            visible_ids = torch.where(visible_mask)[0]
-        else:
-            visible_mask = (info["radii"] > 0.0).all(dim=-1).any(dim=0)
-            visible_ids = torch.where(visible_mask)[0]
-
-        if len(visible_ids) == 0:
+        gs_ids, camera_ids, coords = self._get_visible_projection_info(info, packed=packed)
+        if gs_ids.numel() == 0:
             state["coverage_ema"].mul_(self.coverage_ema_decay)
             return
 
         state["coverage_ema"].mul_(self.coverage_ema_decay)
+        visible_weight = torch.zeros(n_gaussian, device=device)
+        visible_weight.index_add_(
+            0, gs_ids, torch.ones_like(gs_ids, device=device, dtype=torch.float32)
+        )
+        visible_ids = torch.where(visible_weight > 0)[0]
         state["coverage_ema"][visible_ids] += 1.0 - self.coverage_ema_decay
+
+        if self.residual_key not in info:
+            return
+
+        residual_map = info[self.residual_key]
+        if not torch.is_tensor(residual_map):
+            residual_map = torch.tensor(residual_map, device=device)
+        residual_map = residual_map.detach().to(device=device).float()
+        if residual_map.ndim == 2:
+            residual_map = residual_map.unsqueeze(0)
+        if residual_map.numel() == 0:
+            return
+
+        sampled_residuals = self._sample_residual_map(
+            residual_map=residual_map,
+            camera_ids=camera_ids,
+            coords=coords,
+            width=info["width"],
+            height=info["height"],
+        )
+        if sampled_residuals.numel() == 0:
+            return
+
+        residual_sum = torch.zeros(n_gaussian, device=device)
+        residual_count = torch.zeros(n_gaussian, device=device)
+        residual_sum.index_add_(0, gs_ids, sampled_residuals)
+        residual_count.index_add_(
+            0, gs_ids, torch.ones_like(sampled_residuals, dtype=torch.float32)
+        )
+        visible_ids = torch.where(residual_count > 0)[0]
+        mean_residual = residual_sum[visible_ids] / residual_count[visible_ids].clamp_min(1)
         state["residual_ema"][visible_ids] = (
             state["residual_ema"][visible_ids] * self.residual_ema_decay
-            + residual_scalar * (1.0 - self.residual_ema_decay)
+            + mean_residual * (1.0 - self.residual_ema_decay)
         )
 
     @torch.no_grad()
@@ -113,26 +139,80 @@ class ResidualCoverageStrategy(DefaultStrategy):
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
-        grad_score = self._normalize(grads)
-        residual_score = self._normalize(state["residual_ema"])
-        score = self.lambda_grad * grad_score + self.lambda_residual * residual_score
+        grad_score = self._rank_normalize(grads)
+        residual_score = self._rank_normalize(self._robust_clip(state["residual_ema"]))
+        coverage_score = self._coverage_reliability(
+            state["coverage_ema"],
+            step=step,
+        )
+        residual_bonus = residual_score * (1.0 - grad_score)
+        score = (
+            self.lambda_grad * grad_score
+            + self.lambda_residual * residual_bonus * coverage_score
+            + self.lambda_coverage * coverage_score
+        )
 
         device = grads.device
-        passes_score = score > self.grow_score
-        passes_coverage = state["coverage_ema"] > self.coverage_min
+        base_grad_mask = grads > self.grow_grad2d
+        if step >= self.coverage_warmup_iter:
+            base_grad_mask &= state["coverage_ema"] > self.base_coverage_min
+
+        relaxed_grad_mask = grads > (self.grow_grad2d * self.relaxed_grad_factor)
+        coverage_gate = state["coverage_ema"] > self._coverage_floor(step)
+        residual_gate = residual_score > self.residual_threshold
+        residual_growth_mask = relaxed_grad_mask & residual_gate & coverage_gate & ~base_grad_mask
+
+        score_gate = torch.zeros_like(base_grad_mask)
+        candidate_ids = torch.where(residual_growth_mask)[0]
+        n_candidates = int(candidate_ids.numel())
+        if n_candidates > 0:
+            residual_budget = n_candidates
+            if self.growth_topk_ratio > 0:
+                residual_budget = max(1, int(n_candidates * self.growth_topk_ratio))
+            if self.max_new_gs > 0:
+                residual_budget = min(
+                    residual_budget,
+                    max(self.max_new_gs - int(base_grad_mask.sum().item()), 0),
+                )
+            if residual_budget > 0:
+                topk_ids = candidate_ids[
+                    torch.topk(
+                        score[candidate_ids],
+                        k=min(residual_budget, n_candidates),
+                        largest=True,
+                    ).indices
+                ]
+                score_gate[topk_ids] = True
+
+        grow_mask = base_grad_mask | score_gate
 
         is_small = (
             torch.exp(params["scales"]).max(dim=-1).values
             <= self.grow_scale3d * state["scene_scale"]
         )
-        is_dupli = passes_score & passes_coverage & is_small
+        is_dupli = grow_mask & is_small
         n_dupli = is_dupli.sum().item()
 
         is_large = ~is_small
-        is_split = passes_score & passes_coverage & is_large
+        is_split = grow_mask & is_large
         if step < self.refine_scale2d_stop_iter and state.get("radii") is not None:
             is_split |= state["radii"] > self.grow_scale2d
         n_split = is_split.sum().item()
+
+        if self.max_new_gs > 0 and (n_dupli + n_split) > self.max_new_gs:
+            candidate_score = torch.where(base_grad_mask, grad_score, torch.full_like(score, -1.0))
+            candidate_score = torch.where(score_gate, score, candidate_score)
+            keep_k = min(self.max_new_gs, int(grow_mask.sum().item()))
+            limited_mask = torch.zeros_like(grow_mask)
+            if keep_k > 0:
+                keep_ids = torch.topk(candidate_score, k=keep_k, largest=True).indices
+                limited_mask[keep_ids] = True
+            is_dupli = limited_mask & is_small
+            is_split = limited_mask & is_large
+            if step < self.refine_scale2d_stop_iter and state.get("radii") is not None:
+                is_split |= (state["radii"] > self.grow_scale2d) & limited_mask
+            n_dupli = is_dupli.sum().item()
+            n_split = is_split.sum().item()
 
         if n_dupli > 0:
             duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
@@ -191,19 +271,106 @@ class ResidualCoverageStrategy(DefaultStrategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         state: Dict[str, Any],
     ) -> torch.Tensor:
-        opacity_score = self._normalize(torch.sigmoid(params["opacities"].flatten()))
-        coverage_score = self._normalize(state["coverage_ema"])
-        residual_score = self._normalize(state["residual_ema"])
+        opacity_score = self._rank_normalize(torch.sigmoid(params["opacities"].flatten()))
+        coverage_score = self._coverage_reliability(state["coverage_ema"])
+        residual_score = self._rank_normalize(self._robust_clip(state["residual_ema"]))
+        unreliable_high_residual = residual_score * (1.0 - coverage_score)
+        hard_region_bonus = residual_score * coverage_score
         return (
             self.prune_opacity_weight * opacity_score
             + self.prune_coverage_weight * coverage_score
-            + self.prune_residual_weight * residual_score
+            + self.prune_residual_weight * hard_region_bonus
+            - 0.25 * unreliable_high_residual
         )
 
     @staticmethod
-    def _normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    def _get_visible_projection_info(
+        info: Dict[str, Any], packed: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if packed:
+            gs_ids = info["gaussian_ids"]
+            camera_ids = info["camera_ids"]
+            coords = info["means2d"]
+        else:
+            visible_mask = (info["radii"] > 0.0).all(dim=-1)
+            camera_ids, gs_ids = torch.where(visible_mask)
+            coords = info["means2d"][visible_mask]
+        return gs_ids.long(), camera_ids.long(), coords
+
+    @staticmethod
+    def _sample_residual_map(
+        residual_map: torch.Tensor,
+        camera_ids: torch.Tensor,
+        coords: torch.Tensor,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        if coords.numel() == 0:
+            return torch.empty(0, device=residual_map.device)
+
+        camera_ids = camera_ids.clamp_(0, residual_map.shape[0] - 1)
+        xs = coords[:, 0].float().clamp(0.0, max(width - 1, 0))
+        ys = coords[:, 1].float().clamp(0.0, max(height - 1, 0))
+
+        x0 = torch.floor(xs).long()
+        y0 = torch.floor(ys).long()
+        x1 = (x0 + 1).clamp(max=width - 1)
+        y1 = (y0 + 1).clamp(max=height - 1)
+
+        wx = xs - x0.float()
+        wy = ys - y0.float()
+
+        v00 = residual_map[camera_ids, y0, x0]
+        v01 = residual_map[camera_ids, y0, x1]
+        v10 = residual_map[camera_ids, y1, x0]
+        v11 = residual_map[camera_ids, y1, x1]
+
+        return (
+            (1.0 - wx) * (1.0 - wy) * v00
+            + wx * (1.0 - wy) * v01
+            + (1.0 - wx) * wy * v10
+            + wx * wy * v11
+        )
+
+    @staticmethod
+    def _robust_clip(x: torch.Tensor) -> torch.Tensor:
         if x is None or x.numel() == 0:
             return x
-        x_min = x.min()
-        x_max = x.max()
-        return (x - x_min) / (x_max - x_min + eps)
+        lo = torch.quantile(x, 0.02)
+        hi = torch.quantile(x, 0.98)
+        return x.clamp(min=lo, max=hi)
+
+    @staticmethod
+    def _rank_normalize(x: torch.Tensor) -> torch.Tensor:
+        if x is None or x.numel() == 0:
+            return x
+        if x.numel() == 1:
+            return torch.ones_like(x)
+        order = torch.argsort(x, stable=True)
+        ranks = torch.empty_like(order, dtype=torch.float32)
+        ranks[order] = torch.linspace(0.0, 1.0, x.numel(), device=x.device)
+        return ranks
+
+    def _coverage_floor(self, step: int) -> float:
+        if self.coverage_warmup_iter <= 0:
+            return self.coverage_min
+        progress = min(max(step, 0) / float(self.coverage_warmup_iter), 1.0)
+        return self.coverage_min * progress
+
+    def _coverage_reliability(
+        self,
+        coverage_ema: torch.Tensor,
+        step: int | None = None,
+    ) -> torch.Tensor:
+        if coverage_ema is None or coverage_ema.numel() == 0:
+            return coverage_ema
+        target = max(self.target_coverage, 1e-6)
+        peak = max(self.coverage_peak, target)
+        coverage = (coverage_ema / target).clamp(0.0, 1.0)
+        if peak > target:
+            decay = ((coverage_ema - target) / (peak - target)).clamp(0.0, 1.0)
+            coverage = coverage * (1.0 - 0.25 * decay)
+        if step is not None and self.coverage_warmup_iter > 0:
+            progress = min(max(step, 0) / float(self.coverage_warmup_iter), 1.0)
+            coverage = (1.0 - progress) + progress * coverage
+        return coverage
