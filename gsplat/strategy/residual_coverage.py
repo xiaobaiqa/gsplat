@@ -52,6 +52,14 @@ class ResidualCoverageStrategy(DefaultStrategy):
     target_coverage: float = 0.2
     coverage_peak: float = 0.6
     growth_topk_ratio: float = 0.12
+    residual_budget_ratio: float = 0.25
+    residual_warmup_iter: int = 7000
+    min_residual_budget: int = 16
+    max_residual_budget: int = 2048
+    growth_pressure_start: float = 18.0
+    growth_pressure_end: float = 28.0
+    grad_threshold_gain: float = 0.5
+    residual_threshold_gain: float = 0.15
     max_new_gs: int = -1
     cap_max: int = -1
     prune_opacity_weight: float = 0.5
@@ -63,6 +71,7 @@ class ResidualCoverageStrategy(DefaultStrategy):
         state = super().initialize_state(scene_scale=scene_scale)
         state["residual_ema"] = None
         state["coverage_ema"] = None
+        state["init_n_gaussians"] = None
         return state
 
     def _update_state(
@@ -80,6 +89,8 @@ class ResidualCoverageStrategy(DefaultStrategy):
             state["residual_ema"] = torch.zeros(n_gaussian, device=device)
         if state["coverage_ema"] is None:
             state["coverage_ema"] = torch.zeros(n_gaussian, device=device)
+        if state["init_n_gaussians"] is None:
+            state["init_n_gaussians"] = n_gaussian
 
         gs_ids, camera_ids, coords = self._get_visible_projection_info(info, packed=packed)
         if gs_ids.numel() == 0:
@@ -145,6 +156,12 @@ class ResidualCoverageStrategy(DefaultStrategy):
             state["coverage_ema"],
             step=step,
         )
+        pressure = self._growth_pressure(state, len(params["means"]))
+        grad_threshold = self.grow_grad2d * (1.0 + self.grad_threshold_gain * pressure)
+        residual_threshold = min(
+            self.residual_threshold + self.residual_threshold_gain * pressure,
+            0.95,
+        )
         residual_bonus = residual_score * (1.0 - grad_score)
         score = (
             self.lambda_grad * grad_score
@@ -153,13 +170,14 @@ class ResidualCoverageStrategy(DefaultStrategy):
         )
 
         device = grads.device
-        base_grad_mask = grads > self.grow_grad2d
+        base_grad_mask = grads > grad_threshold
         if step >= self.coverage_warmup_iter:
             base_grad_mask &= state["coverage_ema"] > self.base_coverage_min
+        n_base = int(base_grad_mask.sum().item())
 
-        relaxed_grad_mask = grads > (self.grow_grad2d * self.relaxed_grad_factor)
+        relaxed_grad_mask = grads > (grad_threshold * self.relaxed_grad_factor)
         coverage_gate = state["coverage_ema"] > self._coverage_floor(step)
-        residual_gate = residual_score > self.residual_threshold
+        residual_gate = residual_score > residual_threshold
         residual_growth_mask = relaxed_grad_mask & residual_gate & coverage_gate & ~base_grad_mask
 
         score_gate = torch.zeros_like(base_grad_mask)
@@ -169,10 +187,14 @@ class ResidualCoverageStrategy(DefaultStrategy):
             residual_budget = n_candidates
             if self.growth_topk_ratio > 0:
                 residual_budget = max(1, int(n_candidates * self.growth_topk_ratio))
+            residual_budget = min(
+                residual_budget,
+                self._residual_budget_limit(n_base=n_base, step=step, pressure=pressure),
+            )
             if self.max_new_gs > 0:
                 residual_budget = min(
                     residual_budget,
-                    max(self.max_new_gs - int(base_grad_mask.sum().item()), 0),
+                    max(self.max_new_gs - n_base, 0),
                 )
             if residual_budget > 0:
                 topk_ids = candidate_ids[
@@ -374,3 +396,28 @@ class ResidualCoverageStrategy(DefaultStrategy):
             progress = min(max(step, 0) / float(self.coverage_warmup_iter), 1.0)
             coverage = (1.0 - progress) + progress * coverage
         return coverage
+
+    def _residual_budget_limit(self, n_base: int, step: int, pressure: float) -> int:
+        if self.residual_budget_ratio <= 0.0:
+            return self.min_residual_budget if step >= self.coverage_warmup_iter else 0
+
+        warmup_progress = 1.0
+        if self.residual_warmup_iter > 0:
+            warmup_progress = min(max(step, 0) / float(self.residual_warmup_iter), 1.0)
+
+        base_budget = max(int(n_base * self.residual_budget_ratio), self.min_residual_budget)
+        base_budget = min(base_budget, self.max_residual_budget)
+        base_budget = int(base_budget * warmup_progress * (1.0 - pressure))
+        return max(base_budget, 0)
+
+    def _growth_pressure(self, state: Dict[str, Any], n_current: int) -> float:
+        init_n = state.get("init_n_gaussians")
+        if init_n is None or init_n <= 0:
+            return 0.0
+        multiplier = float(n_current) / float(init_n)
+        if self.growth_pressure_end <= self.growth_pressure_start:
+            return float(multiplier >= self.growth_pressure_start)
+        pressure = (multiplier - self.growth_pressure_start) / (
+            self.growth_pressure_end - self.growth_pressure_start
+        )
+        return float(min(max(pressure, 0.0), 1.0))
