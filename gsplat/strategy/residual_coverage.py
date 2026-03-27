@@ -60,7 +60,7 @@ class ResidualCoverageStrategy(DefaultStrategy):
     growth_pressure_end: float = 28.0
     grad_threshold_gain: float = 0.5
     residual_threshold_gain: float = 0.15
-    max_new_gs: int = -1
+    max_new_gs: int = 16000
     cap_max: int = -1
     prune_opacity_weight: float = 0.5
     prune_coverage_weight: float = 0.3
@@ -150,34 +150,25 @@ class ResidualCoverageStrategy(DefaultStrategy):
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
-        grad_score = self._rank_normalize(grads)
-        residual_score = self._rank_normalize(self._robust_clip(state["residual_ema"]))
-        coverage_score = self._coverage_reliability(
-            state["coverage_ema"],
-            step=step,
-        )
+        residual_ema = state["residual_ema"]
+        coverage_ema = state["coverage_ema"]
+        coverage_score = self._coverage_reliability(coverage_ema, step=step)
         pressure = self._growth_pressure(state, len(params["means"]))
         grad_threshold = self.grow_grad2d * (1.0 + self.grad_threshold_gain * pressure)
         residual_threshold = min(
             self.residual_threshold + self.residual_threshold_gain * pressure,
             0.95,
         )
-        residual_bonus = residual_score * (1.0 - grad_score)
-        score = (
-            self.lambda_grad * grad_score
-            + self.lambda_residual * residual_bonus * coverage_score
-            + self.lambda_coverage * coverage_score
-        )
 
         device = grads.device
         base_grad_mask = grads > grad_threshold
         if step >= self.coverage_warmup_iter:
-            base_grad_mask &= state["coverage_ema"] > self.base_coverage_min
+            base_grad_mask &= coverage_ema > self.base_coverage_min
         n_base = int(base_grad_mask.sum().item())
 
         relaxed_grad_mask = grads > (grad_threshold * self.relaxed_grad_factor)
-        coverage_gate = state["coverage_ema"] > self._coverage_floor(step)
-        residual_gate = residual_score > residual_threshold
+        coverage_gate = coverage_ema > self._coverage_floor(step)
+        residual_gate = residual_ema > residual_threshold
         residual_growth_mask = relaxed_grad_mask & residual_gate & coverage_gate & ~base_grad_mask
 
         score_gate = torch.zeros_like(base_grad_mask)
@@ -197,9 +188,21 @@ class ResidualCoverageStrategy(DefaultStrategy):
                     max(self.max_new_gs - n_base, 0),
                 )
             if residual_budget > 0:
+                candidate_grad_ratio = (
+                    grads[candidate_ids] / max(grad_threshold, 1e-8)
+                ).clamp(0.0, 2.0)
+                candidate_residual_ratio = (
+                    residual_ema[candidate_ids] / max(residual_threshold, 1e-8)
+                ).clamp(0.0, 3.0)
+                candidate_score = (
+                    self.lambda_residual
+                    * candidate_residual_ratio
+                    * (2.0 - candidate_grad_ratio)
+                    * coverage_score[candidate_ids]
+                )
                 topk_ids = candidate_ids[
                     torch.topk(
-                        score[candidate_ids],
+                        candidate_score,
                         k=min(residual_budget, n_candidates),
                         largest=True,
                     ).indices
@@ -222,8 +225,16 @@ class ResidualCoverageStrategy(DefaultStrategy):
         n_split = is_split.sum().item()
 
         if self.max_new_gs > 0 and (n_dupli + n_split) > self.max_new_gs:
-            candidate_score = torch.where(base_grad_mask, grad_score, torch.full_like(score, -1.0))
-            candidate_score = torch.where(score_gate, score, candidate_score)
+            grad_priority = (grads / max(grad_threshold, 1e-8)).clamp_min(0.0)
+            residual_priority = (
+                residual_ema / max(residual_threshold, 1e-8)
+            ).clamp(0.0, 3.0) * coverage_score
+            candidate_score = torch.where(
+                base_grad_mask,
+                grad_priority,
+                torch.full_like(grad_priority, -1.0),
+            )
+            candidate_score = torch.where(score_gate, residual_priority, candidate_score)
             keep_k = min(self.max_new_gs, int(grow_mask.sum().item()))
             limited_mask = torch.zeros_like(grow_mask)
             if keep_k > 0:
@@ -293,16 +304,16 @@ class ResidualCoverageStrategy(DefaultStrategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         state: Dict[str, Any],
     ) -> torch.Tensor:
-        opacity_score = self._rank_normalize(torch.sigmoid(params["opacities"].flatten()))
+        opacity_score = torch.sigmoid(params["opacities"].flatten())
         coverage_score = self._coverage_reliability(state["coverage_ema"])
-        residual_score = self._rank_normalize(self._robust_clip(state["residual_ema"]))
-        unreliable_high_residual = residual_score * (1.0 - coverage_score)
+        residual_score = (state["residual_ema"] / max(self.residual_threshold, 1e-8)).clamp(
+            0.0, 1.0
+        )
         hard_region_bonus = residual_score * coverage_score
         return (
             self.prune_opacity_weight * opacity_score
             + self.prune_coverage_weight * coverage_score
             + self.prune_residual_weight * hard_region_bonus
-            - 0.25 * unreliable_high_residual
         )
 
     @staticmethod
@@ -353,25 +364,6 @@ class ResidualCoverageStrategy(DefaultStrategy):
             + (1.0 - wx) * wy * v10
             + wx * wy * v11
         )
-
-    @staticmethod
-    def _robust_clip(x: torch.Tensor) -> torch.Tensor:
-        if x is None or x.numel() == 0:
-            return x
-        lo = torch.quantile(x, 0.02)
-        hi = torch.quantile(x, 0.98)
-        return x.clamp(min=lo, max=hi)
-
-    @staticmethod
-    def _rank_normalize(x: torch.Tensor) -> torch.Tensor:
-        if x is None or x.numel() == 0:
-            return x
-        if x.numel() == 1:
-            return torch.ones_like(x)
-        order = torch.argsort(x, stable=True)
-        ranks = torch.empty_like(order, dtype=torch.float32)
-        ranks[order] = torch.linspace(0.0, 1.0, x.numel(), device=x.device)
-        return ranks
 
     def _coverage_floor(self, step: int) -> float:
         if self.coverage_warmup_iter <= 0:

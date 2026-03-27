@@ -1,6 +1,6 @@
 SCENE="garden"
 SCENE_DIR="data/360_v2"
-RESULT_DIR="results/benchmark_rc_15000_capped40k/garden"
+RESULT_DIR="results/benchmark_rc_30000_capped32k/garden"
 
 CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
     --disable-viewer \
@@ -8,9 +8,9 @@ CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
     --data-factor 4 \
     --result-dir ${RESULT_DIR}/ \
     --batch-size 1 \
-    --max-steps 15000 \
-    --eval-steps 7000 15000 \
-    --save-steps 7000 15000 \
+    --max-steps 30000 \
+    --eval-steps 7000 30000 \
+    --save-steps 7000 30000 \
     --test-every 8 \
     --init-type sfm \
     --init-num-pts 100000 \
@@ -51,4 +51,4 @@ CUDA_VISIBLE_DEVICES=0 python simple_trainer.py residual_coverage \
     --strategy.target-coverage 0.15 \
     --strategy.residual-ema-decay 0.9 \
     --strategy.coverage-ema-decay 0.99 \
-    --strategy.max-new-gs 40000
+    --strategy.max-new-gs 32000
