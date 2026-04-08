@@ -83,6 +83,9 @@ class ResidualCoverageStrategy(DefaultStrategy):
     replace_guard_residual_scale: float = 0.85
     replace_guard_steps: int = 5
     use_default_refine: bool = False
+    growth_spike_guard: bool = True
+    growth_spike_ratio_limit: float = 1.5
+    growth_spike_warmup_iter: int = 2500
     contribution_ema_decay: float = 0.96
     prune_contribution_weight: float = 0.35
     residual_threshold_early_scale: float = 0.92
@@ -303,6 +306,11 @@ class ResidualCoverageStrategy(DefaultStrategy):
             coverage_score=coverage_score,
             residual_threshold=residual_threshold,
             gate_min_score=gate_min_score,
+            step=step,
+        )
+        effective_max_new_gs = self._apply_growth_spike_guard(
+            state=state,
+            effective_max_new_gs=effective_max_new_gs,
             step=step,
         )
 
@@ -616,6 +624,25 @@ class ResidualCoverageStrategy(DefaultStrategy):
 
         scaled_budget = int(max_new_gs * demand_scale)
         return max(scaled_budget, self.min_residual_budget)
+
+    def _apply_growth_spike_guard(
+        self,
+        state: Dict[str, Any],
+        effective_max_new_gs: int,
+        step: int,
+    ) -> int:
+        if effective_max_new_gs <= 0 or not self.growth_spike_guard:
+            return effective_max_new_gs
+        if step < self.growth_spike_warmup_iter:
+            return effective_max_new_gs
+
+        prev_growth = int(state.get("last_growth_count", 0))
+        if prev_growth <= 0:
+            return effective_max_new_gs
+
+        spike_cap = int(prev_growth * self.growth_spike_ratio_limit)
+        spike_cap = max(spike_cap, self.min_residual_budget * 4)
+        return min(effective_max_new_gs, spike_cap)
 
     def _scheduled_residual_threshold_scale(self, step: int) -> float:
         return self._linear_schedule(
